@@ -1,13 +1,54 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { ProjectSummary } from "../src/lib/api";
 import { DatasetsView } from "../src/views/DatasetsView";
+
+/** Owns project state like App does, so attach flows re-render the view. */
+function Harness({
+  onProjectChanged = vi.fn(),
+}: {
+  onProjectChanged?: (p: ProjectSummary) => void;
+}) {
+  const [project, setProject] = useState<ProjectSummary>(PROJECT);
+  return (
+    <DatasetsView
+      project={project}
+      onProjectChanged={(updated) => {
+        setProject(updated);
+        onProjectChanged(updated);
+      }}
+    />
+  );
+}
+
+const PROJECT = {
+  id: "a".repeat(32),
+  name: "Microchannel FC-72",
+  description: "",
+  datasets: ["sample"],
+  created_at: "2026-07-24T00:00:00+00:00",
+};
 
 const DETAIL = {
   id: "sample",
   n_frames: 3,
   processed: false,
+  conditions_set: false,
+  frame_px: [16, 12] as [number, number],
   has_qc: false,
+  holdout_frame: 6,
+  um_per_px: null,
+  notes: "Frames 1-10 continuous growth.",
+  excluded_frames: [] as number[],
+  exclusions_applied: false,
   conditions: {
     fluid: "FC-72",
     T_sat_C: 56.6,
@@ -20,9 +61,60 @@ const DETAIL = {
     n_frames_raw: 12,
     n_frames_usable: 11,
     n_frames_event: 10,
+    U_ref_m_s: 0.2,
   },
 };
-const GROUPS = { Re: 215.5, We: 2.302, Ca: 0.01068, Pr: 9.411, Bond: 0.0746, hele_shaw: 0.2228, bretherton_film_um: 4.875, Dh_um: 200 };
+const GROUPS = {
+  Re: 215.5,
+  We: 2.302,
+  Ca: 0.01068,
+  Pr: 9.411,
+  Bond: 0.0746,
+  hele_shaw: 0.2228,
+  bretherton_film_um: 4.875,
+  Dh_um: 200,
+};
+const QC = {
+  dataset: "sample",
+  n_frames_event: 3,
+  kinematics: {
+    t_ms: [0, 0.5, 1.0],
+    length_um: [600, 800, 1000],
+    fit_slope_mm_s: 180,
+    fit_intercept_um: 610,
+  },
+  interface: {
+    x_pin_star: 0.1,
+    x_range: [0, 5.7] as [number, number],
+    y_range: [0, 1] as [number, number],
+    l_ref_um: 300,
+    frames: [
+      {
+        index: 0,
+        t_ms: 0,
+        rings: [
+          [
+            [0.2, 0.3],
+            [0.4, 0.3],
+            [0.4, 0.5],
+            [0.2, 0.5],
+            [0.2, 0.3],
+          ],
+        ],
+      },
+    ],
+  },
+  sdf: {
+    frame_index: 1,
+    t_ms: 0.5,
+    x_range: [0, 5.7] as [number, number],
+    y_range: [0, 1] as [number, number],
+    values: [
+      [-0.5, 0.5],
+      [0.2, 0.9],
+    ],
+  },
+};
 const IDLE = { dataset: "sample", state: "idle", message: null, has_qc: false };
 
 function json(body: unknown) {
@@ -30,32 +122,129 @@ function json(body: unknown) {
 }
 
 interface Calls {
-  upload: number;
-  startPreprocess: number;
+  upload: string[];
+  startPreprocess: string[];
+  conditionPatches: Record<string, unknown>[];
+  projectPatches: Record<string, unknown>[];
+  exclusionPuts: number[][];
 }
 
-function mockApi(): Calls {
-  const calls: Calls = { upload: 0, startPreprocess: 0 };
+function mockApi({
+  processed = false,
+  holdout = 6,
+  excluded = [] as number[],
+  exclusionStatus = 200,
+} = {}): Calls {
+  const calls: Calls = {
+    upload: [],
+    startPreprocess: [],
+    conditionPatches: [],
+    projectPatches: [],
+    exclusionPuts: [],
+  };
+  // The endpoint replaces the set, so the mock keeps the series' current one.
+  let excludedFrames = excluded;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string | URL, opts?: RequestInit) => {
       const u = String(url);
       const post = opts?.method === "POST";
-      if (u.endsWith("/api/datasets")) return json([{ id: "sample", n_frames: 3, processed: false }]);
+      if (u.endsWith("/api/datasets")) {
+        const rows = [
+          {
+            id: "sample",
+            n_frames: 3,
+            processed,
+            conditions_set: false,
+            frame_px: [16, 12],
+            dt_frame_ms: 0.5,
+          },
+        ];
+        if (calls.upload.includes("mid_T")) {
+          rows.push({
+            id: "mid_T",
+            n_frames: 5,
+            processed: false,
+            conditions_set: false,
+            frame_px: [16, 12],
+            dt_frame_ms: 0.5,
+          });
+        }
+        return json(rows);
+      }
       if (u.endsWith("/api/runs")) return json([]);
       if (u.endsWith("/groups")) return json(GROUPS);
-      if (u.endsWith("/upload")) {
-        calls.upload += 1;
-        return json({ id: "sample", n_frames: 5, processed: false });
+      if (u.endsWith("/qc-data")) {
+        return processed ? json(QC) : new Response("{}", { status: 404 });
       }
-      if (u.endsWith("/preprocess")) {
+      if (u.endsWith("/conditions") && opts?.method === "PATCH") {
+        const body = JSON.parse(String(opts.body));
+        calls.conditionPatches.push(body);
+        return json({
+          conditions: { ...DETAIL.conditions, ...body },
+          groups: { ...GROUPS, Re: 431.0 },
+        });
+      }
+      const upload = u.match(/\/api\/datasets\/([^/]+)\/upload$/);
+      if (upload && post) {
+        calls.upload.push(upload[1]);
+        return json({
+          id: upload[1],
+          n_frames: 5,
+          processed: false,
+          conditions_set: false,
+          frame_px: [16, 12],
+        });
+      }
+      const pre = u.match(/\/api\/datasets\/([^/]+)\/preprocess$/);
+      if (pre) {
         if (post) {
-          calls.startPreprocess += 1;
-          return json({ ...IDLE, state: "running" });
+          calls.startPreprocess.push(pre[1]);
+          return json({ ...IDLE, dataset: pre[1], state: "running" });
         }
-        return json(IDLE);
+        // Once started, the job settles immediately so polling flows finish.
+        const done = calls.startPreprocess.includes(pre[1]);
+        return json({
+          ...IDLE,
+          dataset: pre[1],
+          state: done ? "done" : "idle",
+        });
       }
-      if (/\/api\/datasets\/[^/]+$/.test(u)) return json(DETAIL);
+      const patch = u.match(/\/api\/projects\/([0-9a-f]{32})$/);
+      if (patch && opts?.method === "PATCH") {
+        const body = JSON.parse(String(opts.body));
+        calls.projectPatches.push(body);
+        return json({ ...PROJECT, ...body });
+      }
+      if (u.endsWith("/excluded-frames") && opts?.method === "PUT") {
+        const body = JSON.parse(String(opts.body)) as {
+          excluded_frames: number[];
+        };
+        calls.exclusionPuts.push(body.excluded_frames);
+        if (exclusionStatus !== 200) {
+          return new Response(
+            JSON.stringify({ detail: "frame 9 is outside the sequence" }),
+            {
+              status: exclusionStatus,
+            },
+          );
+        }
+        excludedFrames = body.excluded_frames;
+        return json({
+          ...DETAIL,
+          processed,
+          holdout_frame: holdout,
+          excluded_frames: excludedFrames,
+        });
+      }
+      if (/\/api\/datasets\/[^/]+$/.test(u)) {
+        return json({
+          ...DETAIL,
+          processed,
+          holdout_frame: holdout,
+          excluded_frames: excludedFrames,
+        });
+      }
       return new Response("not found", { status: 404 });
     }),
   );
@@ -64,39 +253,351 @@ function mockApi(): Calls {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("DatasetsView", () => {
-  it("shows operating conditions, live groups, and the image sequence", async () => {
-    mockApi();
-    render(<DatasetsView datasetId="sample" />);
+const noop = vi.fn();
 
-    expect(await screen.findByText("Operating conditions")).toBeInTheDocument();
-    expect(screen.getByText("FC-72")).toBeInTheDocument();
-    expect(screen.getByText("300×150")).toBeInTheDocument();
-    expect(screen.getByText("215.5")).toBeInTheDocument(); // live Reynolds
-    expect(screen.getAllByAltText(/frame \d+/).length).toBe(3); // image sequence
+describe("DatasetsView", () => {
+  it("shows the series library, frame strip, conditions, and groups", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    expect(await screen.findByText("Series library")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /sample/ })).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Image sequence · sample/),
+    ).toBeInTheDocument();
+    expect(screen.getAllByAltText(/Frame \d+ preview/).length).toBe(3);
+    // Conditions are editable inputs with unit suffixes.
+    expect(screen.getByLabelText(/Frame interval/)).toHaveValue(0.5);
+    expect(screen.getByLabelText(/Reference velocity/)).toHaveValue(0.2);
+    // Groups render as tiles.
+    expect(await screen.findByText("215.5")).toBeInTheDocument();
   });
 
-  it("uploads selected frames through the API", async () => {
+  it("saves an edited condition on blur and applies the recomputed groups", async () => {
     const calls = mockApi();
-    render(<DatasetsView datasetId="sample" />);
-    const input = (await screen.findByLabelText(/Image sequence \(TIFF frames\)/)) as HTMLInputElement;
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
 
-    const file = new File([new Uint8Array([0x49, 0x49, 0x2a, 0x00])], "1.tif", { type: "image/tiff" });
-    fireEvent.change(input, { target: { files: [file] } });
+    const dt = await screen.findByLabelText(/Frame interval/);
+    fireEvent.change(dt, { target: { value: "0.4" } });
+    fireEvent.blur(dt);
 
-    await waitFor(() => expect(calls.upload).toBe(1));
+    await waitFor(() =>
+      expect(calls.conditionPatches).toEqual([{ dt_frame_ms: 0.4 }]),
+    );
+    expect(await screen.findByText("431.0")).toBeInTheDocument(); // live Re
+  });
+
+  it("uploads a new series through the modal and preprocesses it", async () => {
+    const calls = mockApi();
+    const onProjectChanged = vi.fn();
+    render(<Harness onProjectChanged={onProjectChanged} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Upload new series/ }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Upload new series",
+    });
+    expect(dialog).toBeInTheDocument();
+
+    const form = within(dialog);
+    fireEvent.change(form.getByLabelText("Series name"), {
+      target: { value: "mid_T" },
+    });
+    const file = new File([new Uint8Array([0x49, 0x49, 0x2a, 0x00])], "1.tif", {
+      type: "image/tiff",
+    });
+    fireEvent.change(form.getByLabelText(/Image sequence/), {
+      target: { files: [file] },
+    });
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "0.25" },
+    });
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Upload & preprocess" }),
+    );
+
+    await waitFor(() =>
+      expect(calls.projectPatches).toEqual([{ datasets: ["sample", "mid_T"] }]),
+    );
+    expect(calls.upload).toEqual(["mid_T"]);
+    // The pipeline runs right after the upload…
+    await waitFor(() => expect(calls.startPreprocess).toEqual(["mid_T"]));
+    // …and the modal closes on completion (polling saw state: done).
+    await waitFor(
+      () =>
+        expect(
+          screen.queryByRole("dialog", { name: "Upload new series" }),
+        ).toBeNull(),
+      { timeout: 4000 },
+    );
+    expect(onProjectChanged).toHaveBeenCalledWith(
+      expect.objectContaining({ datasets: ["sample", "mid_T"] }),
+    );
+    // The refreshed library shows the new series without a reload.
+    expect(
+      await screen.findByRole("button", { name: /mid_T/ }),
+    ).toBeInTheDocument();
   });
 
   it("starts preprocessing when the button is clicked", async () => {
     const calls = mockApi();
-    render(<DatasetsView datasetId="sample" />);
-    const button = await screen.findByRole("button", { name: /Run preprocessing/ });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    const button = await screen.findByRole("button", {
+      name: /Run preprocessing/,
+    });
 
     fireEvent.click(button);
-    await waitFor(() => expect(calls.startPreprocess).toBe(1));
+    await waitFor(() => expect(calls.startPreprocess).toEqual(["sample"]));
   });
 
-  it("polls a running job to completion and shows the QC preview", async () => {
+  it("shows the interactive QC checks once the series is preprocessed", async () => {
+    mockApi({ processed: true });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    expect(await screen.findByText("Preprocessing QC")).toBeInTheDocument();
+    // Three checks behind one switch; kinematics is the default tab.
+    expect(
+      screen.getByRole("tab", { name: /Growth kinematics/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("img", {
+        name: /Bubble length in micrometres against time/,
+      }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Interface evolution/ }));
+    expect(
+      screen.getByRole("img", { name: /Bubble outline for \d+ frames/ }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Signed distance/ }));
+    expect(
+      screen.getByRole("img", { name: /Signed distance field/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("marks the holdout frame in the strip", async () => {
+    mockApi({ holdout: 2 });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    // The tile is a toggle; its accessible name carries the state, so the
+    // holdout is announced rather than only being amber.
+    expect(
+      await screen.findByRole("button", { name: /Frame 2,.*holdout frame/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Frame 1, included in training$/ }),
+    );
+  });
+});
+
+describe("DatasetsView with several series", () => {
+  it("scopes the library to the project's series and switches between them", async () => {
+    mockApi();
+    const twoSeries = { ...PROJECT, datasets: ["sample", "mid_T"] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.endsWith("/api/datasets")) {
+          return json([
+            {
+              id: "sample",
+              n_frames: 3,
+              processed: true,
+              conditions_set: true,
+              frame_px: [16, 12],
+              dt_frame_ms: 0.5,
+            },
+            {
+              id: "mid_T",
+              n_frames: 2,
+              processed: false,
+              conditions_set: false,
+              frame_px: [16, 12],
+              dt_frame_ms: 0.5,
+            },
+            {
+              id: "foreign",
+              n_frames: 9,
+              processed: false,
+              conditions_set: false,
+              frame_px: null,
+              dt_frame_ms: null,
+            },
+          ]);
+        }
+        if (u.endsWith("/api/runs")) return json([]);
+        if (u.endsWith("/groups")) return json(GROUPS);
+        if (u.endsWith("/qc-data")) return new Response("{}", { status: 404 });
+        if (u.endsWith("/preprocess")) return json(IDLE);
+        const detail = u.match(/\/api\/datasets\/([^/]+)$/);
+        if (detail) return json({ ...DETAIL, id: detail[1], processed: false });
+        return new Response("not found", { status: 404 });
+      }),
+    );
+    render(<DatasetsView project={twoSeries} onProjectChanged={noop} />);
+
+    // Both project series are listed; the foreign dataset is not.
+    expect(
+      await screen.findByRole("button", { name: /sample/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /mid_T/ })).toBeInTheDocument();
+    expect(screen.queryByText("foreign")).not.toBeInTheDocument();
+    // Per-series chips are independent: processed+conditions vs bare upload.
+    expect(screen.getByText("tensors ready")).toBeInTheDocument();
+    expect(screen.getByText("needs conditions")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /mid_T/ }));
+    expect(
+      await screen.findByText(/Image sequence · mid_T/),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("NewSeriesModal failure paths", () => {
+  function openFormAndFill(name = "mid_T") {
+    fireEvent.click(screen.getByRole("button", { name: /Upload new series/ }));
+    // Scope to the dialog: the conditions panel behind it uses the same labels.
+    const form = within(
+      screen.getByRole("dialog", { name: "Upload new series" }),
+    );
+    fireEvent.change(form.getByLabelText("Series name"), {
+      target: { value: name },
+    });
+    const file = new File([new Uint8Array([0x49, 0x49, 0x2a, 0x00])], "1.tif", {
+      type: "image/tiff",
+    });
+    fireEvent.change(form.getByLabelText(/Image sequence/), {
+      target: { files: [file] },
+    });
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "0.25" },
+    });
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+  }
+
+  it("reports a failed upload and never attempts the attach", async () => {
+    const calls = mockApi();
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const real = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(
+      async (url: string | URL, opts?: RequestInit) => {
+        if (String(url).endsWith("/upload")) {
+          return new Response(JSON.stringify({ detail: "too many frames" }), {
+            status: 400,
+          });
+        }
+        return real(url, opts);
+      },
+    );
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText("Series library");
+    openFormAndFill();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Upload & preprocess" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Upload failed: too many/,
+    );
+    expect(calls.projectPatches).toEqual([]);
+  });
+
+  it("distinguishes an attach failure from an upload failure", async () => {
+    const calls = mockApi();
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const real = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(
+      async (url: string | URL, opts?: RequestInit) => {
+        if (/\/api\/projects\//.test(String(url)) && opts?.method === "PATCH") {
+          return new Response(JSON.stringify({ detail: "disk full" }), {
+            status: 500,
+          });
+        }
+        return real(url, opts);
+      },
+    );
+    const onProjectChanged = vi.fn();
+    render(
+      <DatasetsView project={PROJECT} onProjectChanged={onProjectChanged} />,
+    );
+    await screen.findByText("Series library");
+    openFormAndFill();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Upload & preprocess" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Uploaded, but linking the series failed: disk full/,
+    );
+    expect(calls.upload).toEqual(["mid_T"]); // frames did land on disk
+    expect(onProjectChanged).not.toHaveBeenCalled();
+  });
+
+  it("rejects a duplicate series name before any request", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText("Series library");
+    openFormAndFill("sample"); // already in the project
+
+    expect(
+      screen.getByText(/A series with this name already exists/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Upload & preprocess" }),
+    ).toBeDisabled();
+  });
+});
+
+describe("ConditionsPanel behavior", () => {
+  it("surfaces the API's rejection of a bad value", async () => {
+    mockApi();
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const real = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(
+      async (url: string | URL, opts?: RequestInit) => {
+        if (String(url).endsWith("/conditions")) {
+          return new Response(
+            JSON.stringify({ detail: "dt_frame_ms must be a positive number" }),
+            { status: 400 },
+          );
+        }
+        return real(url, opts);
+      },
+    );
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    const dt = await screen.findByLabelText(/Frame interval/);
+    fireEvent.change(dt, { target: { value: "3" } });
+    fireEvent.blur(dt);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Frame interval: dt_frame_ms must be a positive number/,
+    );
+  });
+
+  it("does not PATCH when the value is unchanged", async () => {
+    const calls = mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    const dt = await screen.findByLabelText(/Frame interval/);
+    fireEvent.change(dt, { target: { value: "0.5" } }); // same as current
+    fireEvent.blur(dt);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls.conditionPatches).toEqual([]);
+  });
+});
+
+describe("DatasetsView preprocess polling", () => {
+  it("polls a running job to completion and refreshes the series", async () => {
     let started = false;
     let polls = 0;
     vi.stubGlobal(
@@ -104,34 +605,49 @@ describe("DatasetsView", () => {
       vi.fn(async (url: string | URL, opts?: RequestInit) => {
         const u = String(url);
         const post = opts?.method === "POST";
+        const done = polls >= 2;
         if (u.endsWith("/api/datasets")) {
-          return json([{ id: "sample", n_frames: 3, processed: polls >= 2 }]);
+          return json([
+            {
+              id: "sample",
+              n_frames: 3,
+              processed: done,
+              conditions_set: false,
+              frame_px: [16, 12],
+              dt_frame_ms: 0.5,
+            },
+          ]);
         }
+        if (u.endsWith("/api/runs")) return json([]);
         if (u.endsWith("/groups")) return json(GROUPS);
+        if (u.endsWith("/qc-data")) {
+          return done ? json(QC) : new Response("{}", { status: 404 });
+        }
         if (u.endsWith("/preprocess")) {
           if (post) {
             started = true;
             return json({ ...IDLE, state: "running" });
           }
-          if (!started) return json(IDLE); // idle until a POST starts it
+          if (!started) return json(IDLE);
           polls += 1;
-          const done = polls >= 2;
-          return json({ ...IDLE, state: done ? "done" : "running", has_qc: done });
+          return json({ ...IDLE, state: polls >= 2 ? "done" : "running" });
         }
-        if (/\/api\/datasets\/[^/]+$/.test(u)) return json({ ...DETAIL, has_qc: polls >= 2 });
+        if (/\/api\/datasets\/[^/]+$/.test(u))
+          return json({ ...DETAIL, processed: done });
         return new Response("not found", { status: 404 });
       }),
     );
 
-    render(<DatasetsView datasetId="sample" />);
-    const button = await screen.findByRole("button", { name: /Run preprocessing/ });
-    fireEvent.click(button);
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Run preprocessing/ }),
+    );
 
-    // The hook polls every 1s (real timers); wait until the job completes and the
-    // QC preview appears — proving the running->done transition + refresh + cleanup.
+    // Real timers: the hook polls every 1s until done, then refreshes ;
+    // proven by the QC panel appearing once the series reports processed.
     await waitFor(
-      () => expect(screen.getByRole("img", { name: /quality-control/ })).toBeInTheDocument(),
-      { timeout: 4000 },
+      () => expect(screen.getByText("Preprocessing QC")).toBeInTheDocument(),
+      { timeout: 5000 },
     );
     expect(polls).toBeGreaterThanOrEqual(2);
   });
@@ -145,9 +661,413 @@ describe("DatasetsView failure paths", () => {
         throw new TypeError("Failed to fetch");
       }),
     );
-    render(<DatasetsView />);
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/Could not load datasets/);
     expect(screen.queryByText("Loading datasets…")).not.toBeInTheDocument();
+  });
+});
+
+describe("frame exclusion", () => {
+  /** The tile toggle for a 1-based camera frame. */
+  const tile = (n: number) =>
+    screen.getByRole("button", { name: new RegExp(`^Frame ${n},`) });
+
+  it("excludes a frame on click and sends the whole new set", async () => {
+    const calls = mockApi({ excluded: [1] });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    fireEvent.click(tile(3));
+
+    // The set is replaced, not appended to; frame 1 must survive the round trip.
+    await waitFor(() => expect(calls.exclusionPuts).toEqual([[1, 3]]));
+    await waitFor(() =>
+      expect(tile(3)).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(await screen.findByText(/2 excluded \(1, 3\)/)).toBeInTheDocument();
+  });
+
+  it("includes an excluded frame again on a second click", async () => {
+    const calls = mockApi({ excluded: [3] });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+    await waitFor(() =>
+      expect(tile(3)).toHaveAttribute("aria-pressed", "true"),
+    );
+
+    fireEvent.click(tile(3));
+
+    await waitFor(() => expect(calls.exclusionPuts).toEqual([[]]));
+    await waitFor(() =>
+      expect(tile(3)).toHaveAttribute("aria-pressed", "false"),
+    );
+  });
+
+  it("refuses to exclude the holdout frame without calling the API", async () => {
+    const calls = mockApi({ holdout: 2 });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    fireEvent.click(tile(2));
+
+    expect(
+      await screen.findByText(/only unsupervised check/),
+    ).toBeInTheDocument();
+    expect(calls.exclusionPuts).toEqual([]);
+    expect(tile(2)).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("reverts the tile and surfaces the reason when the API rejects the edit", async () => {
+    mockApi({ exclusionStatus: 400 });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    fireEvent.click(tile(3));
+
+    // The border must never claim an exclusion the server did not accept.
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /outside the sequence/,
+    );
+    await waitFor(() =>
+      expect(tile(3)).toHaveAttribute("aria-pressed", "false"),
+    );
+  });
+
+  it("warns that saved exclusions need a preprocessing re-run", async () => {
+    mockApi({ processed: true, excluded: [3] });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+
+    // DETAIL carries exclusions_applied: false, so the tensors are out of date.
+    expect(
+      await screen.findByText(
+        /excluded frames have changed since the tensors were built/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Re-run" })).toBeInTheDocument();
+  });
+
+  it("opens the frame full size on double-click without toggling it", async () => {
+    const calls = mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    fireEvent.doubleClick(tile(2));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /Frame 2 of sample/,
+    });
+    expect(dialog).toBeInTheDocument();
+    // The two clicks a double-click also delivers must not have excluded it.
+    await waitFor(() => expect(calls.exclusionPuts).toEqual([]));
+  });
+
+  it("steps frames with the arrow keys and closes on Escape", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+    fireEvent.doubleClick(tile(2));
+    await screen.findByRole("dialog", { name: /Frame 2 of sample/ });
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(
+      await screen.findByRole("dialog", { name: /Frame 3 of sample/ }),
+    ).toBeInTheDocument();
+
+    // Frame 3 is the last of the 3-frame series; the axis must not run past it.
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(
+      await screen.findByRole("dialog", { name: /Frame 3 of sample/ }),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("offers an enlarge control so the lightbox is reachable by keyboard", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Enlarge frame 2" }));
+
+    expect(
+      await screen.findByRole("dialog", { name: /Frame 2 of sample/ }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("frame strip scrolling", () => {
+  /** jsdom lays nothing out, so the strip has to be told it overflows. */
+  function makeScrollable(width = 200, content = 1200) {
+    const strip = document.querySelector<HTMLElement>(".strip");
+    if (!strip) throw new Error("no frame strip rendered");
+    Object.defineProperty(strip, "clientWidth", {
+      value: width,
+      configurable: true,
+    });
+    Object.defineProperty(strip, "scrollWidth", {
+      value: content,
+      configurable: true,
+    });
+    fireEvent.scroll(strip); // re-measure through the component's own listener
+    return strip;
+  }
+
+  it("shows a scrollbar only when the frames overflow", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+
+    // Nothing overflows by default in jsdom, so nothing to scroll.
+    expect(screen.queryByRole("scrollbar")).not.toBeInTheDocument();
+
+    makeScrollable();
+
+    const bar = await screen.findByRole("scrollbar", { name: /frame strip/i });
+    expect(bar).toHaveAttribute("aria-orientation", "horizontal");
+    expect(bar).toHaveAttribute("aria-valuenow", "0");
+  });
+
+  it("scrolls the strip horizontally from a plain vertical mouse wheel", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+    const strip = makeScrollable();
+
+    // A wheel only emits deltaY; without the mapping the strip never moves and
+    // the page scrolls past it instead.
+    fireEvent.wheel(strip, { deltaY: 120, deltaX: 0 });
+
+    expect(strip.scrollLeft).toBe(120);
+  });
+
+  it("hands the wheel back to the page at the end of the strip", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+    const strip = makeScrollable();
+    strip.scrollLeft = 1000; // scrollWidth - clientWidth
+
+    const event = new WheelEvent("wheel", {
+      deltaY: 120,
+      cancelable: true,
+      bubbles: true,
+    });
+    strip.dispatchEvent(event);
+
+    // Not swallowed, so the page scrolls rather than the pointer being trapped.
+    expect(event.defaultPrevented).toBe(false);
+    expect(strip.scrollLeft).toBe(1000);
+  });
+
+  it("moves the strip with the arrow keys on the scrollbar", async () => {
+    mockApi();
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText(/Image sequence · sample/);
+    const strip = makeScrollable();
+    strip.scrollBy = vi.fn(({ left }: ScrollToOptions = {}) => {
+      strip.scrollLeft += left ?? 0;
+    }) as never;
+
+    fireEvent.keyDown(await screen.findByRole("scrollbar"), {
+      key: "ArrowRight",
+    });
+
+    expect(strip.scrollLeft).toBeGreaterThan(0);
+  });
+});
+
+describe("new series conditions", () => {
+  const tiff = () =>
+    new File([new Uint8Array([0x49, 0x49, 0x2a, 0x00])], "1.tif", {
+      type: "image/tiff",
+    });
+
+  /** Queries scoped to the dialog: the conditions panel behind it shares labels. */
+  async function openModal() {
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Upload new series/ }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Upload new series",
+    });
+    const form = within(dialog);
+    fireEvent.change(form.getByLabelText("Series name"), {
+      target: { value: "mid_T" },
+    });
+    fireEvent.change(form.getByLabelText(/Image sequence/), {
+      target: { files: [tiff()] },
+    });
+    return form;
+  }
+
+  const submit = () =>
+    screen.getByRole("button", { name: "Upload & preprocess" });
+
+  it("will not upload until the frame interval and channel width are given", async () => {
+    mockApi();
+    render(<Harness />);
+    const form = await openModal();
+
+    // Name and frames alone are not enough: preprocessing bakes these two in.
+    expect(submit()).toBeDisabled();
+
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "0.25" },
+    });
+    expect(submit()).toBeDisabled();
+
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+    expect(submit()).toBeEnabled();
+  });
+
+  it("rejects a frame interval outside the server's bounds", async () => {
+    mockApi();
+    render(<Harness />);
+    const form = await openModal();
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "-1" },
+    });
+
+    expect(form.getByLabelText(/Frame interval/)).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+    expect(submit()).toBeDisabled();
+  });
+
+  it("saves the conditions before preprocessing, not after", async () => {
+    const calls = mockApi();
+    const order: string[] = [];
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(
+      async (url: string | URL, opts?: RequestInit) => {
+        const u = String(url);
+        if (u.endsWith("/conditions")) order.push("conditions");
+        if (u.endsWith("/preprocess") && opts?.method === "POST")
+          order.push("preprocess");
+        return original(url, opts);
+      },
+    );
+
+    render(<Harness />);
+    const form = await openModal();
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "0.25" },
+    });
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+    fireEvent.click(submit());
+
+    await waitFor(() => expect(calls.startPreprocess).toEqual(["mid_T"]));
+    // Tensors built before the conditions land would carry the wrong time axis
+    // and the wrong µm/px, and nothing downstream would say so.
+    expect(order).toEqual(["conditions", "preprocess"]);
+    expect(calls.conditionPatches).toEqual([
+      { dt_frame_ms: 0.25, channel_width_um: 400 },
+    ]);
+  });
+
+  it("does not preprocess when the conditions could not be saved", async () => {
+    const calls = mockApi();
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(
+      async (url: string | URL, opts?: RequestInit) => {
+        if (String(url).endsWith("/conditions")) {
+          return new Response(
+            JSON.stringify({ detail: "dt_frame_ms out of range" }),
+            {
+              status: 400,
+            },
+          );
+        }
+        return original(url, opts);
+      },
+    );
+
+    render(<Harness />);
+    const form = await openModal();
+    fireEvent.change(form.getByLabelText(/Frame interval/), {
+      target: { value: "0.25" },
+    });
+    fireEvent.change(form.getByLabelText(/Channel width/), {
+      target: { value: "400" },
+    });
+    fireEvent.click(submit());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /operating conditions could not be saved/,
+    );
+    // Silently preprocessing with another series' values is the failure mode
+    // this whole flow exists to prevent.
+    expect(calls.startPreprocess).toEqual([]);
+  });
+});
+
+describe("QC chart axes", () => {
+  async function showCheck(name: RegExp) {
+    mockApi({ processed: true });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText("Preprocessing QC");
+    fireEvent.click(screen.getByRole("tab", { name }));
+  }
+
+  it("names the quantity and unit on both axes of the kinematics chart", async () => {
+    mockApi({ processed: true });
+    render(<DatasetsView project={PROJECT} onProjectChanged={noop} />);
+    await screen.findByText("Preprocessing QC");
+
+    // Tick numbers alone do not say what is being measured.
+    expect(screen.getByText(/t \(ms\)/)).toBeInTheDocument();
+    expect(screen.getByText(/L \(µm\)/)).toBeInTheDocument();
+  });
+
+  it("names both axes of the interface chart in physical units", async () => {
+    await showCheck(/Interface evolution/);
+
+    expect(screen.getByText(/x \(µm\), downstream/)).toBeInTheDocument();
+    expect(screen.getByText(/y \(µm\), across channel/)).toBeInTheDocument();
+  });
+
+  it("names both axes of the signed-distance chart", async () => {
+    await showCheck(/Signed distance/);
+
+    expect(screen.getByText(/x \(µm\), downstream/)).toBeInTheDocument();
+    expect(screen.getByText("y (µm)")).toBeInTheDocument();
+  });
+
+  it("draws each frame as one closed silhouette, not loose arcs", async () => {
+    await showCheck(/Interface evolution/);
+
+    const shapes = document.querySelectorAll(".qc-silhouette");
+    expect(shapes).toHaveLength(1); // the fixture has one frame
+    // A ring that does not close leaves the bubble looking broken.
+    expect(shapes[0].getAttribute("d")).toMatch(/Z$/);
+    expect(shapes[0].getAttribute("fill")).toBeTruthy();
+  });
+
+  it("keeps chart text off SVG's black default on the dark canvas", async () => {
+    await showCheck(/Interface evolution/);
+
+    // The class has to land where the CSS can reach it; a bare <text> with a
+    // descendant-only rule falls back to black and is invisible here.
+    for (const label of document.querySelectorAll("text.chart-axis-title")) {
+      expect(label.classList.contains("chart-axis-title")).toBe(true);
+    }
+    expect(
+      document.querySelectorAll("text.chart-axis-title").length,
+    ).toBeGreaterThan(0);
   });
 });

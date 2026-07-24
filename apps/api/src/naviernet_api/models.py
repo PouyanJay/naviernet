@@ -58,17 +58,28 @@ class OperatingConditions(BaseModel):
     n_frames_raw: int
     n_frames_usable: int
     n_frames_event: int
+    U_ref_m_s: float | None = None  # reference velocity (nondimensionalisation)
 
 
 class ProjectSummary(BaseModel):
-    """A project: a uuid identity with editable metadata, linked to a dataset
-    once data has been uploaded."""
+    """A project: a uuid identity with editable metadata and the series
+    (datasets under data/raw/) uploaded into it."""
 
     id: str
     name: str
     description: str = ""
-    dataset: str | None = None  # data/raw/<dataset> once attached
+    datasets: list[str] = []  # series ids, in upload order
     created_at: str  # ISO-8601 UTC
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_single_dataset(cls, data: dict) -> dict:
+        """Files written before multi-series support carried `dataset: str|null`."""
+        if isinstance(data, dict) and "datasets" not in data and "dataset" in data:
+            data = dict(data)
+            legacy = data.pop("dataset")
+            data["datasets"] = [legacy] if legacy else []
+        return data
 
 
 class ProjectCreate(BaseModel):
@@ -83,7 +94,7 @@ class ProjectUpdate(BaseModel):
 
     name: str | None = None
     description: str | None = None
-    dataset: str | None = None
+    datasets: list[str] | None = None  # full replacement list; null clears
 
 
 class DatasetSummary(BaseModel):
@@ -92,6 +103,79 @@ class DatasetSummary(BaseModel):
     id: str
     n_frames: int  # raw TIFFs present on disk
     processed: bool  # preprocessed tensors exist
+    conditions_set: bool = False  # per-series conditions.json saved
+    frame_px: tuple[int, int] | None = None  # (width, height) of the raw frames
+    dt_frame_ms: float | None = None  # frame interval, from the series' config
+
+
+class ConditionsUpdate(BaseModel):
+    """Editable per-series operating conditions; omitted fields keep their
+    current (config-default or previously saved) value."""
+
+    T_sat_C: float | None = None
+    dt_frame_ms: float | None = None
+    channel_width_um: float | None = None
+    channel_height_um: float | None = None
+    flow_rate_mL_hr: float | None = None
+    q_wall_W_cm2: float | None = None
+    U_ref: float | None = None
+
+
+class QcKinematics(BaseModel):
+    """Bubble length per frame plus the linear growth fit."""
+
+    t_ms: list[float]
+    length_um: list[float]
+    fit_slope_mm_s: float
+    fit_intercept_um: float
+
+
+class QcInterfaceFrame(BaseModel):
+    """One frame's bubble silhouette as closed [x*, y*] rings.
+
+    Closed, not open polylines: the bubble spans the channel, so its α = 0.5
+    contour runs into the top and bottom of the imaged band. Rings carry the
+    boundary segments too, giving a complete outline instead of two loose arcs.
+    """
+
+    index: int
+    t_ms: float
+    rings: list[list[list[float]]]
+
+
+class QcInterface(BaseModel):
+    x_pin_star: float
+    x_range: list[float]
+    y_range: list[float]
+    l_ref_um: float  # x* · l_ref_um = µm, for physical axis labels
+    frames: list[QcInterfaceFrame]
+
+
+class QcSdf(BaseModel):
+    """The mid-frame signed distance field, decimated for the browser."""
+
+    frame_index: int
+    t_ms: float
+    x_range: list[float]
+    y_range: list[float]
+    values: list[list[float]]
+
+
+class QcData(BaseModel):
+    """The three preprocessing checks as chart data."""
+
+    dataset: str
+    n_frames_event: int
+    kinematics: QcKinematics
+    interface: QcInterface
+    sdf: QcSdf
+
+
+class ConditionsResponse(BaseModel):
+    """A conditions edit round-trip: the saved values + recomputed groups."""
+
+    conditions: OperatingConditions
+    groups: dict[str, float]
 
 
 class DatasetDetail(BaseModel):
@@ -101,7 +185,22 @@ class DatasetDetail(BaseModel):
     n_frames: int
     processed: bool
     has_qc: bool  # a preprocessing QC figure exists
+    conditions_set: bool = False
+    frame_px: tuple[int, int] | None = None
+    holdout_frame: int | None = None  # 1-based camera frame that is never supervised
+    um_per_px: float | None = None  # calibration, once preprocessed
+    notes: str | None = None  # the experiment's frame-usage story
     conditions: OperatingConditions
+    excluded_frames: list[int] = []  # 1-based camera frames kept out of the tensors
+    # Whether the preprocessed tensors were built with the exclusions above; false
+    # means an edit is pending a preprocessing re-run.
+    exclusions_applied: bool = False
+
+
+class ExclusionsUpdate(BaseModel):
+    """Full replacement of a series' excluded camera frames (1-based)."""
+
+    excluded_frames: list[int]
 
 
 class PreprocessStatus(BaseModel):
@@ -129,7 +228,7 @@ class RunLaunchRequest(BaseModel):
     Every numeric field maps 1:1 onto `cfg.training`; the bounds exist because
     the Hydra schema types but does not range-check its values, and these come
     from the network (SECURITY.md §4). On resume only `steps` and `render`
-    apply — the rest of the configuration is fixed by the original run's own
+    apply; the rest of the configuration is fixed by the original run's own
     config snapshot, and any other values sent here are ignored.
     """
 
@@ -173,7 +272,7 @@ class RunJobStatus(BaseModel):
 class SweepLaunchRequest(RunLaunchRequest):
     """A request to run the same configuration across several seeds.
 
-    Children are ordinary runs (train + evaluate; rendering defaults off — a
+    Children are ordinary runs (train + evaluate; rendering defaults off; a
     sweep is for comparison, not deliverables). `seed` is ignored; `seeds`
     drives the children. Sweeps never resume.
     """
